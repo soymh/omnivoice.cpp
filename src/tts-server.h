@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,18 @@ struct tts_request {
     // random seed per request, matching the CLI convention; anything
     // else forwards verbatim for reproducible output.
     int64_t seed;
+
+    // Omnivoice extension fields (optional, parsed from JSON body)
+    std::optional<std::string> ov_lang;
+    std::optional<std::string> ov_instruct;
+    std::optional<float>       ov_duration_sec;
+    std::optional<bool>        ov_no_denoise;
+    std::optional<float>       ov_chunk_duration_sec;
+    std::optional<float>       ov_chunk_threshold_sec;
+    std::optional<std::string> ov_format;          // "wav16" / "wav24" / "wav32"
+    std::optional<bool>        ov_stream;          // stream chunks as they're produced
+    std::optional<std::string> ov_ref_wav_base64;  // base64-encoded WAV for per-request voice cloning
+    std::optional<std::string> ov_ref_text;        // transcript for per-request reference
 };
 
 // The adapter pushes mono f32 24 kHz audio here. Returns false to abort the
@@ -58,11 +71,18 @@ struct tts_backend {
     // the ABI status (0 on success), and fills err with the ABI message on
     // failure. The shared layer maps the status to an HTTP code.
     std::function<int(const tts_request & req, const tts_sink & sink, std::string & err)> synthesize;
+    // Returns a JSON string describing server properties. Called by GET /props.
+    std::function<std::string()> get_props;
+    // Default WAV output format. Overridable per-request via ov_format.
+    WavFormat wav_fmt = WAV_S16;
 };
 
 struct server_config {
     std::string host = "127.0.0.1";
     int         port = 8080;
+    int         read_timeout_sec = 60;
+    int         write_timeout_sec = 120;
+    int         n_parallel = 1;
 };
 
 // Single GPU context : synthesis is serialised FIFO across connections.
@@ -153,6 +173,57 @@ static bool tts_parse_request(const std::string & body, tts_request & req, std::
     }
     req.seed = seed ? yyjson_get_sint(seed) : -1;
 
+    // Omnivoice extension fields (all optional)
+    yyjson_val * ov_lang = yyjson_obj_get(root, "lang");
+    if (yyjson_is_str(ov_lang)) {
+        req.ov_lang = yyjson_get_str(ov_lang);
+    }
+
+    yyjson_val * ov_instruct = yyjson_obj_get(root, "instruct");
+    if (yyjson_is_str(ov_instruct)) {
+        req.ov_instruct = yyjson_get_str(ov_instruct);
+    }
+
+    yyjson_val * ov_dur = yyjson_obj_get(root, "duration");
+    if (yyjson_is_num(ov_dur)) {
+        req.ov_duration_sec = (float) yyjson_get_num(ov_dur);
+    }
+
+    yyjson_val * ov_no_denoise = yyjson_obj_get(root, "no_denoise");
+    if (yyjson_is_bool(ov_no_denoise)) {
+        req.ov_no_denoise = yyjson_get_bool(ov_no_denoise);
+    }
+
+    yyjson_val * ov_cd = yyjson_obj_get(root, "chunk_duration");
+    if (yyjson_is_num(ov_cd)) {
+        req.ov_chunk_duration_sec = (float) yyjson_get_num(ov_cd);
+    }
+
+    yyjson_val * ov_ct = yyjson_obj_get(root, "chunk_threshold");
+    if (yyjson_is_num(ov_ct)) {
+        req.ov_chunk_threshold_sec = (float) yyjson_get_num(ov_ct);
+    }
+
+    yyjson_val * ov_fmt = yyjson_obj_get(root, "format");
+    if (yyjson_is_str(ov_fmt)) {
+        req.ov_format = yyjson_get_str(ov_fmt);
+    }
+
+    yyjson_val * ov_stream = yyjson_obj_get(root, "stream");
+    if (yyjson_is_bool(ov_stream)) {
+        req.ov_stream = yyjson_get_bool(ov_stream);
+    }
+
+    yyjson_val * ov_ref = yyjson_obj_get(root, "ref_wav_base64");
+    if (yyjson_is_str(ov_ref)) {
+        req.ov_ref_wav_base64 = yyjson_get_str(ov_ref);
+    }
+
+    yyjson_val * ov_ref_text = yyjson_obj_get(root, "ref_text");
+    if (yyjson_is_str(ov_ref_text)) {
+        req.ov_ref_text = yyjson_get_str(ov_ref_text);
+    }
+
     yyjson_doc_free(doc);
 
     if (req.format != "pcm" && req.format != "wav") {
@@ -175,6 +246,18 @@ static int tts_status_to_http(int rc) {
     return 502;
 }
 
+// Resolve the WAV output format. Per-request ov_format takes priority;
+// otherwise use the backend default.
+static WavFormat tts_resolve_wav_fmt(const tts_backend & be, const tts_request & req) {
+    if (req.ov_format.has_value()) {
+        WavFormat fmt = WAV_S16;
+        if (audio_parse_format(req.ov_format->c_str(), fmt)) {
+            return fmt;
+        }
+    }
+    return be.wav_fmt;
+}
+
 static void tts_handle_speech(const tts_backend & be, const httplib::Request & http_req, httplib::Response & res) {
     tts_request req;
     std::string err;
@@ -183,8 +266,12 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
         return;
     }
 
-    if (req.format == "wav") {
-        // One-shot : collect the whole utterance, then emit a RIFF file.
+    bool should_stream = (req.format == "pcm") || req.ov_stream.value_or(false);
+
+    if (!should_stream) {
+        // One-shot : collect the whole utterance, then emit a RIFF file
+        // with the resolved WAV format.
+        WavFormat        fmt = tts_resolve_wav_fmt(be, req);
         std::vector<float> buf;
         tts_sink           sink = [&buf](const float * s, int n) {
             buf.insert(buf.end(), s, s + n);
@@ -201,7 +288,7 @@ static void tts_handle_speech(const tts_backend & be, const httplib::Request & h
                            synth_err.empty() ? "synthesis failed" : synth_err.c_str());
             return;
         }
-        std::string wav = audio_encode_wav(buf.data(), (int) buf.size(), 24000, WAV_S16);
+        std::string wav = audio_encode_wav(buf.data(), (int) buf.size(), 24000, fmt);
         res.set_content(std::move(wav), "audio/wav");
         return;
     }
@@ -278,8 +365,8 @@ static int tts_server_run(const tts_backend & be, const server_config & cfg) {
     // per-operation socket idle timeouts. read is small (text in), write is
     // generous to cover a long streamed utterance without tripping on a slow
     // client.
-    svr.set_read_timeout(60);
-    svr.set_write_timeout(120);
+    svr.set_read_timeout(cfg.read_timeout_sec);
+    svr.set_write_timeout(cfg.write_timeout_sec);
 
     // reject oversized bodies. text plus an optional reference clip stays
     // well under this.
@@ -313,11 +400,21 @@ static int tts_server_run(const tts_backend & be, const server_config & cfg) {
 
     svr.Post("/v1/audio/speech",
              [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_speech(be, req, res); });
+    svr.Post("/synthesize",
+             [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_speech(be, req, res); });
     svr.Get("/v1/models",
             [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_models(be, req, res); });
     svr.Get("/v1/voices",
             [&be](const httplib::Request & req, httplib::Response & res) { tts_handle_voices(be, req, res); });
     svr.Get("/health", tts_handle_health);
+    svr.Get("/props", [&be](const httplib::Request &, httplib::Response & res) {
+        if (be.get_props) {
+            std::string json = be.get_props();
+            res.set_content(json, "application/json");
+        } else {
+            res.set_content("{}", "application/json");
+        }
+    });
 
     signal(SIGINT, tts_on_signal);
     signal(SIGTERM, tts_on_signal);
