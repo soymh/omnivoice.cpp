@@ -108,6 +108,17 @@ macro(link_ggml_backends target)
     if(TARGET ggml-sycl AND GGML_SYCL)
         target_link_options(${target} PRIVATE -fsycl)
     endif()
+
+    # CUDA: add the CUDA library directory to rpath so that the linker can
+    # resolve transitive dependencies through libggml-cuda.so (which links
+    # PRIVATE against CUDA::cudart and CUDA::cublas).
+    if(TARGET ggml-cuda AND CUDA_CUDART)
+        get_filename_component(_OV_CUDA_LIB_DIR "${CUDA_CUDART}" DIRECTORY)
+        target_link_options(${target} PRIVATE
+            -L${_OV_CUDA_LIB_DIR}
+            -Wl,-rpath,${_OV_CUDA_LIB_DIR})
+    endif()
+
     add_dependencies(${target} version)
 endmacro()
 
@@ -169,6 +180,12 @@ link_ggml_backends(omnivoice-tts)
 add_executable(tts-server tools/tts-server.cpp)
 target_link_libraries(tts-server PRIVATE omnivoice-core httplib yyjson)
 link_ggml_backends(tts-server)
+
+# omnivoice-server : full-featured HTTP server with all CLI flags,
+# per-request overrides, and reference audio support.
+add_executable(omnivoice-server tools/omnivoice-server.cpp)
+target_link_libraries(omnivoice-server PRIVATE omnivoice-core httplib yyjson)
+link_ggml_backends(omnivoice-server)
 
 # test-abi-c : pure C99 smoke test that locks in the public ABI contract.
 # Compiles omnivoice.h with a C compiler under -Wall -Werror -pedantic and
