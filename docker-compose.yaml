@@ -1,0 +1,46 @@
+# omnivoice-server — Docker Compose
+#
+# Start:
+#   docker compose build
+#   docker compose up -d
+#
+# Stop:
+#   docker compose down
+#
+# Models go in ./models/ relative to this file.
+#
+# Environment overrides (create .env or set in shell):
+#   OMP_NUM_THREADS=4   OpenMP thread count
+#   GGML_BACKEND=CUDA0  force specific GPU device
+
+services:
+  omnivoice-server:
+    build:
+      context: .
+      args:
+        CUDA_ARCHITECTURES: "75-virtual;80-virtual;86-real;89-real"
+        BUILD_TYPE: Release
+    image: omnivoice-server:latest
+    ports:
+      # Localhost only — not accessible from other machines.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Mount model files from host ./models/ into /models/ inside container.
+      - ./models:/models:ro
+    environment:
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-}
+      - GGML_BACKEND=${GGML_BACKEND:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
